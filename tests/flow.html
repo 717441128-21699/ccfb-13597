@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>flow-pipeline-test</title></head>
+<body>
+<h3>光流管线测试(绕过 WebCodecs:渲染 → VideoFrame → 光流 → 风险分 vs 真值)</h3>
+<pre id="out">running…</pre>
+<script type="module">
+import { buildSession, pathPoint, PATH_LENGTH } from '../js/trajectory.js';
+import { SceneRenderer } from '../js/scene.js';
+import { OpticalFlow } from '../js/optflow.js';
+import { computeRisk } from '../js/analyze.js';
+import { pearson } from '../js/util.js';
+
+const post = (obj) => fetch('/__result', { method: 'POST', body: JSON.stringify(obj) }).catch(() => {});
+const out = { sessions: [] };
+try {
+  const N = 5, fps = 30, W = 320, H = 180, skip = 1;
+  for (let i = 0; i < N; i++) {
+    const aggressiveness = 0.08 + 0.92 * (i / (N - 1));
+    const sess = buildSession({ duration: 25, fps, seed: i * 31 + 7, aggressiveness });
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const scene = new SceneRenderer(canvas, sess.level, pathPoint, PATH_LENGTH);
+    const flow = new OpticalFlow();
+    flow.setFov(100, W / H);
+    const stats = [];
+    flow.onBatch = (arr, start, count) => {
+      for (let k = 0; k < count; k++) stats[start + k] = arr.slice(k * 16, k * 16 + 16);
+    };
+    for (let k = 0; k < sess.n; k++) {
+      scene.render(sess.cam.subarray(k * 7, k * 7 + 7), sess.starAlpha[k]);
+      const vf = new VideoFrame(canvas, { timestamp: Math.round(k * 1e6 / fps) });
+      flow.pushFrame(vf);
+      vf.close();
+    }
+    flow.flush();
+    const meta = {
+      fps, poseFps: fps, fovX: 100, width: W, height: H,
+      duration: sess.duration, events: sess.events, trueRisk: sess.trueRisk,
+    };
+    const res = computeRisk(stats, sess.head, meta, skip);
+    const truth = sess.trueRisk.reduce((a, b) => a + b, 0) / sess.trueRisk.length;
+    const rSec = pearson(res.perSecond, sess.trueRisk.slice(0, res.perSecond.length));
+    out.sessions.push({
+      i, aggressiveness: +aggressiveness.toFixed(2),
+      system: res.overall, truth: +truth.toFixed(1),
+      segments: res.segments.length, rPerSec: +rSec.toFixed(3),
+    });
+    post({ step: 'session', i, system: res.overall, truth: +truth.toFixed(1), rPerSec: +rSec.toFixed(3) });
+  }
+  out.rOverall = +pearson(out.sessions.map(s => s.system), out.sessions.map(s => s.truth)).toFixed(3);
+  out.meanRPerSec = +(out.sessions.reduce((a, s) => a + s.rPerSec, 0) / N).toFixed(3);
+  out.ok = out.rOverall > 0.8 && out.meanRPerSec > 0.5;
+} catch (e) {
+  out.error = String(e && e.stack || e);
+}
+document.getElementById('out').textContent = JSON.stringify(out, null, 2);
+post({ step: 'final', out });
+</script>
+</body></html>
