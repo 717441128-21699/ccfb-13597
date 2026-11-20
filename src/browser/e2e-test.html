@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>headless e2e</title></head>
+<body>
+<pre id="out">running...</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (o) => { out.textContent = JSON.stringify(o, null, 1); };
+  try {
+    const { generateSession } = await import('./generator.mjs');
+    const { analyzeVrd } = await import('./analyze-pipeline.mjs');
+    const { parseVrd } = await import('../shared/vrd.mjs');
+    const { createSceneModel, estimateSelfMotion, summarizeFlow } = await import('../shared/scene.mjs');
+    const { DEFAULT_WEIGHTS } = await import('../shared/risk.mjs');
+
+    // ---- 1. 生成 30 秒会话 ----
+    const tGen0 = performance.now();
+    const session = await generateSession({
+      duration: 30, seed: 11,
+      profile: { aggressiveness: 1.1, tunnelFraction: 0.3 },
+      onProgress: () => {},
+    });
+    const genMs = performance.now() - tGen0;
+
+    // ---- 2. 解析 VRD 并走完整解码 + GL 光流链路 ----
+    const parsed = parseVrd(session.bytes);
+    const glCanvas = document.createElement('canvas');
+    glCanvas.width = 256; glCanvas.height = 144;
+    const tAn0 = performance.now();
+    const result = await analyzeVrd(parsed, {
+      canvas: glCanvas, weights: DEFAULT_WEIGHTS, onProgress: () => {},
+    });
+    const anMs = performance.now() - tAn0;
+
+    // ---- 3. 解析真值对照：同一模型的解析光流评分 ----
+    const model = session.model;
+    const { createAnalyzer } = await import('../shared/analyzer.mjs');
+    const truthAnalyzer = createAnalyzer({ grid: model.grid, events: model.events, weights: DEFAULT_WEIGHTS });
+    for (const frame of model.frames) {
+      const fl = model.flowAt(frame);
+      truthAnalyzer.pushFrame({
+        i: frame.i, t: frame.t,
+        headYawRate: frame.headYawRate, headPitchRate: frame.headPitchRate,
+        worldV: frame.worldV, tunnel: frame.tunnel,
+      }, fl);
+    }
+    const truth = truthAnalyzer.finalize();
+
+    // ---- 4. 光流精度：抽样帧比较估计角速度 vs 相机真值（GL 或 CPU 后端）----
+    const { glFlowSupported } = await import('./flow-gl.mjs');
+    const { createFlowCPU } = await import('./flow-cpu.mjs');
+    const flowBackend = glFlowSupported()
+      ? (await import('./flow-gl.mjs')).createFlowGL(document.createElement('canvas'))
+      : createFlowCPU();
+    // 重新解码前 10 秒做精度抽样（从第一个关键帧开始，带 codec description）
+    const decCfg = {
+      codec: parsed.meta.codec,
+      codedWidth: parsed.meta.width,
+      codedHeight: parsed.meta.height,
+    };
+    if (parsed.meta.codec.startsWith('avc')) {
+      decCfg.avc = parsed.description ? { format: 'avc' } : { format: 'annexb' };
+      if (parsed.description) decCfg.description = parsed.description;
+    } else if (parsed.description) {
+      decCfg.description = parsed.description;
+    }
+    const frames = [];
+    const dec2 = new VideoDecoder({
+      output: (f) => { if (frames.length < 900) frames.push(f); else f.close(); },
+      error: (e) => { throw e; },
+    });
+    dec2.configure(decCfg);
+    const firstKey = parsed.video.findIndex((c) => c.isKey);
+    for (const c of parsed.video.slice(firstKey, firstKey + 120)) {
+      dec2.decode(new EncodedVideoChunk({
+        type: c.isKey ? 'key' : 'delta',
+        timestamp: c.timestamp,
+        data: c.data,
+      }));
+    }
+    await dec2.flush();
+    const yawErrs = [];
+    const grid = model.grid;
+    for (let i = 0; i < Math.min(frames.length, model.frames.length); i++) {
+      const { fx, fy } = flowBackend.process(frames[i]);
+      const est = estimateSelfMotion(grid, fx, fy);
+      const truthRate = model.frames[i].camYawRate;
+      if (Math.abs(truthRate) > 0.1) {
+        yawErrs.push(Math.abs((est.yawRate - truthRate) * 180 / Math.PI));
+      }
+      frames[i].close();
+    }
+    dec2.close();
+
+    const scoreDiff = result.perSecond.map((s, i) => Math.abs(s.score - truth.perSecond[i].score));
+    const yawErrMean = yawErrs.reduce((a, b) => a + b, 0) / yawErrs.length;
+    const yawErrP90 = yawErrs.sort((a, b) => a - b)[Math.floor(yawErrs.length * 0.9)];
+    const backend = flowBackend.backend || 'webgl2-lk';
+    const projected10MinSec = anMs / (30 * 90) * 54000 / 1000;
+
+    // 断言按后端区分：WebGL2 走高精度 LK（≤3°/s）；CPU 相位相关是无 GPU 降级，
+    // 只要求流程跑通、预算内、能检出热区，精度门槛放宽。
+    const checks = {
+      pipelineRuns: result.perSecond.length === parsed.meta.duration,
+      withinBudget: projected10MinSec <= 180,
+      detectsZones: result.hotZones.length >= 1,
+      yawAccuracy: backend === 'webgl2-lk' ? yawErrMean <= 3 : yawErrMean <= 60,
+      scoreCorrelated: (() => {
+        const a = result.perSecond.map(s => s.score);
+        const b = truth.perSecond.map(s => s.score);
+        const ma = a.reduce((s, v) => s + v, 0) / a.length;
+        const mb = b.reduce((s, v) => s + v, 0) / b.length;
+        let cov = 0, va = 0, vb = 0;
+        for (let i = 0; i < a.length; i++) {
+          cov += (a[i] - ma) * (b[i] - mb);
+          va += (a[i] - ma) ** 2;
+          vb += (b[i] - mb) ** 2;
+        }
+        return cov / Math.sqrt(va * vb) >= (backend === 'webgl2-lk' ? 0.8 : 0.4);
+      })(),
+    };
+    const report = {
+      ok: Object.values(checks).every(Boolean),
+      checks,
+      generatedFrames: session.meta.frameCount,
+      videoChunks: parsed.video.length,
+      codec: parsed.meta.codec,
+      genMs: Math.round(genMs),
+      analyzeMs: Math.round(anMs),
+      analyzeFps: Math.round(result.timing.fps),
+      glOverallScore: result.overall,
+      truthOverallScore: truth.overall,
+      overallScoreDelta: Math.abs(result.overall - truth.overall),
+      perSecondMaxDelta: Math.max(...scoreDiff),
+      perSecondMeanDelta: +(scoreDiff.reduce((a, b) => a + b, 0) / scoreDiff.length).toFixed(2),
+      glYawErrMeanDeg: +yawErrMean.toFixed(2),
+      glYawErrP90Deg: +yawErrP90.toFixed(2),
+      glSamples: yawErrs.length,
+      flowBackend: backend,
+      pipelineBackend: result.timing.backend,
+      hotZones: result.hotZones.length,
+      projected10MinSec: +projected10MinSec.toFixed(1),
+    };
+    log(report);
+    document.title = 'E2E_DONE';
+    window.__e2e = report;
+  } catch (e) {
+    log({ ok: false, error: e.message, stack: e.stack?.slice(0, 600) });
+    document.title = 'E2E_FAIL';
+    window.__e2e = { ok: false, error: e.message };
+  }
+</script>
+</body>
+</html>

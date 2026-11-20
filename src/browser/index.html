@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VR 晕动风险评估系统</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◎</span>
+      <div>
+        <h1>VR 晕动风险评估系统</h1>
+        <p class="sub">WebCodecs 解码 · WebGL2 金字塔光流 · 头动对照分析</p>
+      </div>
+    </div>
+    <div class="capabilities" id="capabilities"></div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="data">① 数据</button>
+    <button class="tab" data-tab="analyze">② 分析</button>
+    <button class="tab" data-tab="timeline">③ 时间轴</button>
+    <button class="tab" data-tab="heatmap">④ 关卡热区</button>
+    <button class="tab" data-tab="bench">⑤ 性能实测</button>
+  </nav>
+
+  <main>
+    <!-- ① 数据生成/导入 -->
+    <section class="panel active" id="tab-data">
+      <div class="card">
+        <h2>生成合成试玩数据</h2>
+        <p class="hint">程序化走廊场景 + 脚本化移动事件 + 自然头部运动，90fps 录制并实时编码</p>
+        <div class="form-grid">
+          <label>关卡时长（秒）
+            <input type="number" id="duration" value="120" min="10" max="600" step="10">
+          </label>
+          <label>随机种子
+            <input type="number" id="seed" value="42" min="1" max="99999">
+          </label>
+          <label>激进度（0.3 温和 ~ 1.6 激进）
+            <input type="range" id="aggr" min="0.3" max="1.6" step="0.05" value="0.9">
+            <span class="range-val" id="aggrVal">0.90</span>
+          </label>
+          <label>隧道遮罩覆盖率
+            <input type="range" id="tunnel" min="0" max="0.8" step="0.05" value="0.35">
+            <span class="range-val" id="tunnelVal">0.35</span>
+          </label>
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="btnGenerate">生成试玩数据</button>
+          <button class="btn" id="btnCancel" disabled>取消</button>
+          <button class="btn" id="btnDownload" disabled>下载 .vrd</button>
+        </div>
+        <div class="progress" hidden id="genProgressWrap">
+          <div class="progress-bar"><div id="genProgress"></div></div>
+          <span id="genProgressText">0%</span>
+        </div>
+        <div class="result-meta" id="genMeta"></div>
+      </div>
+
+      <div class="card">
+        <h2>导入 .vrd 试玩文件</h2>
+        <p class="hint">支持本系统生成的 VRD1 容器（姿态帧 + 编码视频块）</p>
+        <input type="file" id="fileInput" accept=".vrd">
+        <div class="result-meta" id="loadMeta"></div>
+      </div>
+    </section>
+
+    <!-- ② 分析 -->
+    <section class="panel" id="tab-analyze">
+      <div class="card">
+        <h2>运行晕动风险分析</h2>
+        <p class="hint">WebCodecs 逐帧解码 → WebGL2 LK 光流（仅 16×9 统计读回）→ 8 维特征 → 评分</p>
+        <canvas id="glCanvas" width="256" height="144" hidden></canvas>
+        <div class="btn-row">
+          <button class="btn primary" id="btnAnalyze" disabled>开始分析</button>
+        </div>
+        <div class="progress" hidden id="anProgressWrap">
+          <div class="progress-bar"><div id="anProgress"></div></div>
+          <span id="anProgressText">0%</span>
+        </div>
+        <div id="analyzeSummary"></div>
+      </div>
+    </section>
+
+    <!-- ③ 时间轴 -->
+    <section class="panel" id="tab-timeline">
+      <div class="card">
+        <h2>风险时间轴（每秒评分）</h2>
+        <div class="legend">
+          <span><i style="background:#2ecc71"></i>低 &lt;25</span>
+          <span><i style="background:#f1c40f"></i>中低 &lt;45</span>
+          <span><i style="background:#e67e22"></i>中高 &lt;65</span>
+          <span><i style="background:#e74c3c"></i>高 ≥65</span>
+        </div>
+        <div id="timelineChart"></div>
+        <div id="secondDetail" class="second-detail"><p>把鼠标移到时间轴上查看每秒明细</p></div>
+      </div>
+      <div class="card">
+        <h2>检测到的问题事件</h2>
+        <div id="eventList"></div>
+      </div>
+    </section>
+
+    <!-- ④ 热区图 -->
+    <section class="panel" id="tab-heatmap">
+      <div class="card">
+        <h2>关卡地图热区</h2>
+        <p class="hint">俯视走廊路径，颜色为该位置的风险强度；点击热区查看降风险建议</p>
+        <canvas id="mapCanvas"></canvas>
+        <div id="zoneTips"></div>
+      </div>
+    </section>
+
+    <!-- ⑤ 性能 -->
+    <section class="panel" id="tab-bench">
+      <div class="card">
+        <h2>性能实测（10 分钟 / 54000 帧预算 180 秒）</h2>
+        <div id="benchResults"><p class="hint">运行一次分析后这里显示实测吞吐与预算达成情况</p></div>
+        <div class="btn-row">
+          <button class="btn" id="btnBenchShort">跑 60 秒基准</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="app.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "vr-motion-sickness-risk",
+  "version": "1.0.0",
+  "description": "VR 晕动风险评估系统：WebCodecs 解码 + WebGL2 光流 + 头动对比的浏览器端分析工具",
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs",
+    "test": "node test/validate.mjs",
+    "test:browser": "node test/cdp-runner.mjs",
+    "test:all": "node test/validate.mjs && node test/cdp-runner.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
